@@ -1,111 +1,90 @@
 package main
 
 import (
-	"fmt"
-	"io/ioutil"
+	"chat-go/proto"
+	"context"
 	"log"
-	"net/http"
-	"strings"
+	"net"
+	"os"
+	"sync"
 
-	"github.com/gorilla/websocket"
-	gubrak "github.com/novalagung/gubrak/v2"
+	"google.golang.org/grpc"
+	glog "google.golang.org/grpc/grpclog"
 )
 
-type M map[string]interface{}
+var grpcLog glog.LoggerV2
 
-const MESSAGE_NEW_USER = "New User"
-const MESSAGE_CHAT = "Chat"
-const MESSAGE_LEAVE = "Leave"
-
-var connections = make([]*WebSocketConnection, 0)
-
-type SocketPayload struct {
-	Message string
+func init() {
+	grpcLog = glog.NewLoggerV2(os.Stdout, os.Stdout, os.Stdout)
 }
 
-type SocketResponse struct {
-	From    string
-	Type    string
-	Message string
+type Connection struct {
+	stream proto.Broadcast_CreateStreamServer
+	id     string
+	active bool
+	error  chan error
 }
 
-type WebSocketConnection struct {
-	*websocket.Conn
-	Username string
+type Server struct {
+	Connection []*Connection
+}
+
+func (s *Server) CreateStream(pconn *proto.Connect, stream proto.Broadcast_CreateStreamServer) error {
+	conn := &Connection{
+		stream: stream,
+		id:     pconn.User.Id,
+		active: true,
+		error:  make(chan error),
+	}
+
+	s.Connection = append(s.Connection, conn)
+	return <-conn.error
+}
+
+func (s *Server) BroadcastMessage(ctx context.Context, msg *proto.Message) (*proto.Close, error) {
+	wait := sync.WaitGroup{}
+	done := make(chan int)
+
+	for _, conn := range s.Connection {
+		wait.Add(1)
+
+		go func(msg *proto.Message, conn *Connection) {
+			defer wait.Done()
+
+			if conn.active {
+				err := conn.stream.Send(msg)
+				grpcLog.Info("Sending message to: ", conn.stream)
+
+				if err != nil {
+					grpcLog.Errorf("Error with Stream: %s - Error: %v", conn.stream, err)
+					conn.active = false
+					conn.error <- err
+				}
+			}
+		}(msg, conn)
+	}
+
+	go func() {
+		wait.Wait()
+		close(done)
+	}()
+
+	<-done
+	return &proto.Close{}, nil
 }
 
 func main() {
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		content, err := ioutil.ReadFile("index.html")
-		if err != nil {
-			http.Error(w, "Could not open requested file", http.StatusInternalServerError)
-			return
-		}
+	var connections []*Connection
 
-		fmt.Fprintf(w, "%s", content)
-	})
+	server := &Server{connections}
 
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		currentGorillaConn, err := websocket.Upgrade(w, r, w.Header(), 1024, 1024)
-		if err != nil {
-			http.Error(w, "Could not open websocket connection", http.StatusBadRequest)
-		}
-
-		username := r.URL.Query().Get("username")
-		currentConn := WebSocketConnection{Conn: currentGorillaConn, Username: username}
-		connections = append(connections, &currentConn)
-
-		go handleIO(&currentConn, connections)
-	})
-
-	fmt.Println("Server starting at :8080")
-	http.ListenAndServe(":8080", nil)
-}
-
-func handleIO(currentConn *WebSocketConnection, connections []*WebSocketConnection) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Println("ERROR", fmt.Sprintf("%v", r))
-		}
-	}()
-
-	broadcastMessage(currentConn, MESSAGE_NEW_USER, "")
-
-	for {
-		payload := SocketPayload{}
-		err := currentConn.ReadJSON(&payload)
-		if err != nil {
-			if strings.Contains(err.Error(), "websocket: close") {
-				broadcastMessage(currentConn, MESSAGE_LEAVE, "")
-				ejectConnection(currentConn)
-				return
-			}
-
-			log.Println("ERROR", err.Error())
-			continue
-		}
-
-		broadcastMessage(currentConn, MESSAGE_CHAT, payload.Message)
+	grpcServer := grpc.NewServer()
+	listener, err := net.Listen("tcp", ":8080")
+	if err != nil {
+		log.Fatalf("error creating the server %v", err)
 	}
-}
 
-func ejectConnection(currentConn *WebSocketConnection) {
-	filtered := gubrak.From(connections).Reject(func(each *WebSocketConnection) bool {
-		return each == currentConn
-	}).Result()
-	connections = filtered.([]*WebSocketConnection)
-}
-
-func broadcastMessage(currentConn *WebSocketConnection, kind, message string) {
-	for _, eachConn := range connections {
-		if eachConn == currentConn {
-			continue
-		}
-
-		eachConn.WriteJSON(SocketResponse{
-			From:    currentConn.Username,
-			Type:    kind,
-			Message: message,
-		})
-	}
+	grpcLog.Info("Starting server at port :8080")
+	proto.RegisterBroadcastServer(grpcServer, server)
+	grpcServer.Serve(listener)
 }
